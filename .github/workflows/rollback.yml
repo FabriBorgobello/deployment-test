@@ -83,13 +83,18 @@ jobs:
 
           echo "Version $VERSION found in S3"
 
-      - name: Rollback — sync version to bucket root
+      - name: Download version archive
         run: |
           VERSION="${{ steps.resolve.outputs.version }}"
-          echo "Rolling back to version: $VERSION"
+          echo "Downloading version: $VERSION"
           aws s3 sync \
             "s3://${{ env.S3_BUCKET }}/_versions/$VERSION/" \
-            "s3://${{ env.S3_BUCKET }}/" \
+            dist/
+
+      - name: Rollback — sync to bucket root
+        run: |
+          echo "Rolling back to version: ${{ steps.resolve.outputs.version }}"
+          aws s3 sync dist/ "s3://${{ env.S3_BUCKET }}/" \
             --delete \
             --exclude "_versions/*"
 
