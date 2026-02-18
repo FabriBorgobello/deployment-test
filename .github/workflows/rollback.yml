@@ -96,7 +96,26 @@ jobs:
           echo "Rolling back to version: ${{ steps.resolve.outputs.version }}"
           aws s3 sync dist/ "s3://${{ env.S3_BUCKET }}/" \
             --delete \
-            --exclude "_versions/*"
+            --exclude "_versions/*" \
+            --exact-timestamps
+
+      - name: Update manifest — move rolled-back version to top
+        run: |
+          BUCKET="${{ env.S3_BUCKET }}"
+          VERSION="${{ steps.resolve.outputs.version }}"
+
+          # Move the target version to position 0 (current)
+          jq --arg v "$VERSION" '
+            (map(select(.version == $v))[0]) as $entry |
+            if $entry then
+              [$entry] + map(select(.version != $v))
+            else
+              .
+            end
+          ' manifest.json > manifest_updated.json
+          mv manifest_updated.json manifest.json
+
+          aws s3 cp manifest.json "s3://$BUCKET/_versions/manifest.json"
 
       - name: Invalidate CloudFront cache
         run: |
@@ -110,3 +129,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Version:** ${{ steps.resolve.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **CloudFront:** Invalidation submitted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Updated Manifest" >> $GITHUB_STEP_SUMMARY
+          echo "| # | Version | Timestamp | Commit |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          jq -r 'to_entries[] | "| \(.key + 1) | \(.value.version) | \(.value.timestamp) | \(.value.commit[:7]) |"' manifest.json >> $GITHUB_STEP_SUMMARY
