@@ -34,4 +34,16 @@ echo "6. Deleting Origin Access Control..."
 ETAG=$(aws cloudfront get-origin-access-control --id "$OAC_ID" --profile "$PROFILE" --query 'ETag' --output text)
 aws cloudfront delete-origin-access-control --id "$OAC_ID" --if-match "$ETAG" --profile "$PROFILE"
 
+echo "7. Deleting IAM user access keys..."
+KEY_ID=$(aws iam list-access-keys --user-name github-deploy --profile "$PROFILE" --query 'AccessKeyMetadata[0].AccessKeyId' --output text)
+if [ "$KEY_ID" != "None" ] && [ -n "$KEY_ID" ]; then
+  aws iam delete-access-key --user-name github-deploy --access-key-id "$KEY_ID" --profile "$PROFILE"
+fi
+
+echo "8. Deleting IAM user inline policy..."
+aws iam delete-user-policy --user-name github-deploy --policy-name deploy-policy --profile "$PROFILE"
+
+echo "9. Deleting IAM user..."
+aws iam delete-user --user-name github-deploy --profile "$PROFILE"
+
 echo "=== All resources deleted ==="
