@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: "eu-central-1"
+  S3_BUCKET: "deployment-test-435236384656"
+  CF_DISTRIBUTION: "ELFYVRGZFI053"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        id: version
+        run: |
+          npm run build
+          echo "version=snapshot-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to S3 + CloudFront
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync dist s3://${{ env.S3_BUCKET }} --delete --exclude "_versions/*"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CF_DISTRIBUTION }} \
+            --paths "/*"
+
+      - name: Archive deployed version
+        run: |
+          VERSION="${{ needs.build.outputs.build_version }}"
+          echo "Archiving version: $VERSION"
+          aws s3 sync \
+            "s3://${{ env.S3_BUCKET }}" \
+            "s3://${{ env.S3_BUCKET }}/_versions/$VERSION/" \
+            --exclude "_versions/*"
+
+      - name: Update version manifest
+        run: |
+          BUCKET="${{ env.S3_BUCKET }}"
+          VERSION="${{ needs.build.outputs.build_version }}"
+          MANIFEST_KEY="_versions/manifest.json"
+
+          # Download existing manifest or start with empty array
+          aws s3 cp "s3://$BUCKET/$MANIFEST_KEY" manifest.json 2>/dev/null || echo '[]' > manifest.json
+
+          # Prepend new entry
+          NEW_ENTRY=$(jq -n \
+            --arg version "$VERSION" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg commit "${{ github.sha }}" \
+            '{version: $version, timestamp: $timestamp, commit: $commit}')
+
+          jq --argjson entry "$NEW_ENTRY" '. = [$entry] + .' manifest.json > manifest_updated.json
+          mv manifest_updated.json manifest.json
+
+          # Upload updated manifest
+          aws s3 cp manifest.json "s3://$BUCKET/$MANIFEST_KEY"
+
+      - name: Cleanup old versions (keep 5)
+        run: |
+          BUCKET="${{ env.S3_BUCKET }}"
+
+          TOTAL=$(jq length manifest.json)
+          if [ "$TOTAL" -le 5 ]; then
+            echo "Only $TOTAL versions stored, no cleanup needed."
+            exit 0
+          fi
+
+          echo "Found $TOTAL versions, removing oldest to keep 5..."
+
+          jq -r '.[5:][].version' manifest.json > versions_to_delete.txt
+          while read -r OLD_VERSION; do
+            echo "Deleting version: $OLD_VERSION"
+            aws s3 rm "s3://$BUCKET/_versions/$OLD_VERSION/" --recursive
+          done < versions_to_delete.txt
+
+          # Trim manifest to 5 entries and re-upload
+          jq '.[0:5]' manifest.json > manifest_trimmed.json
+          aws s3 cp manifest_trimmed.json "s3://$BUCKET/_versions/manifest.json"

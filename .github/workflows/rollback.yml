@@ -1,0 +1,107 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to rollback to (or "previous" for the last version before current)'
+        required: true
+        default: "previous"
+        type: string
+
+env:
+  AWS_REGION: "eu-central-1"
+  S3_BUCKET: "deployment-test-435236384656"
+  CF_DISTRIBUTION: "ELFYVRGZFI053"
+
+jobs:
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download and display version manifest
+        id: manifest
+        run: |
+          aws s3 cp "s3://${{ env.S3_BUCKET }}/_versions/manifest.json" manifest.json 2>/dev/null || {
+            echo "::error::No version manifest found."
+            exit 1
+          }
+
+          echo "## Available Versions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| # | Version | Timestamp | Commit |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          jq -r 'to_entries[] | "| \(.key + 1) | \(.value.version) | \(.value.timestamp) | \(.value.commit[:7]) |"' manifest.json >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Resolve target version
+        id: resolve
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+
+          if ! echo "$INPUT_VERSION" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid version format: '$INPUT_VERSION'"
+            exit 1
+          fi
+
+          if [ "$INPUT_VERSION" = "previous" ]; then
+            ENTRY_COUNT=$(jq length manifest.json)
+            if [ "$ENTRY_COUNT" -lt 2 ]; then
+              echo "::error::Cannot rollback to previous: need at least 2 versions in manifest."
+              exit 1
+            fi
+            TARGET_VERSION=$(jq -r '.[1].version' manifest.json)
+            echo "Resolved 'previous' to version: $TARGET_VERSION"
+          else
+            TARGET_VERSION="$INPUT_VERSION"
+          fi
+
+          echo "version=$TARGET_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Validate version exists in S3
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+
+          KEY_COUNT=$(aws s3api list-objects-v2 \
+            --bucket "${{ env.S3_BUCKET }}" \
+            --prefix "_versions/$VERSION/" \
+            --max-items 1 \
+            --query "KeyCount" \
+            --output text)
+
+          if [ "$KEY_COUNT" = "0" ] || [ "$KEY_COUNT" = "None" ] || [ -z "$KEY_COUNT" ]; then
+            echo "::error::Version '$VERSION' not found in S3."
+            exit 1
+          fi
+
+          echo "Version $VERSION found in S3"
+
+      - name: Rollback — sync version to bucket root
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          echo "Rolling back to version: $VERSION"
+          aws s3 sync \
+            "s3://${{ env.S3_BUCKET }}/_versions/$VERSION/" \
+            "s3://${{ env.S3_BUCKET }}/" \
+            --delete \
+            --exclude "_versions/*"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CF_DISTRIBUTION }} \
+            --paths "/*"
+
+      - name: Summary
+        run: |
+          echo "## Rollback Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.resolve.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CloudFront:** Invalidation submitted" >> $GITHUB_STEP_SUMMARY
